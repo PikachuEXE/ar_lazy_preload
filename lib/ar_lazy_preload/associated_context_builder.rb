@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "set"
 require "ar_lazy_preload/association_tree_builder"
 
 module ArLazyPreload
@@ -24,15 +25,15 @@ module ArLazyPreload
     # Takes all the associated records for the records, attached to the :parent_context and creates
     # a preloading context for them
     def perform
-      associated_records = parent_context.records.flat_map do |record|
-        next if record.nil?
+      enumerator = AssociationArrayLikeEnumerator.new(
+        parent_context.records,
+        association_name,
+      )
 
-        record_association = record.public_send(association_name)
-        reflection = reflection_cache[record.class]
-        reflection.collection? ? record_association.target : record_association
-      end
-
-      Context.register(records: associated_records, association_tree: child_association_tree)
+      Context.register(
+        records: enumerator,
+        association_tree: child_association_tree,
+      )
     end
 
     private
@@ -44,10 +45,119 @@ module ArLazyPreload
       AssociationTreeBuilder.new(parent_context.association_tree).subtree_for(association_name)
     end
 
-    def reflection_cache
-      @reflection_cache ||= Hash.new do |hash, klass|
-        hash[klass] = klass.reflect_on_association(association_name)
+    class AssociationArrayLikeEnumerator
+      def initialize(parent_records, association_name, compact: false)
+        @parent_records = parent_records
+        @association_name = association_name
+        @compact = compact
+      end
+
+      def each(*args, &block)
+        enumerator.each(*args, &block)
+      end
+
+      def map(*args, &block)
+        enumerator.map(*args, &block)
+      end
+
+      def all?
+        enumerator.each do |rec|
+          result = yield rec
+          return false unless result
+        end
+
+        true
+      end
+
+      attr_reader :uniq_records
+      alias_method :uniq_records?, :uniq_records
+
+      # Cache size to avoid performance issue on repeated calls
+      def size
+        called_records = uniq_records? ? Set.new : nil
+
+        @size ||= @parent_records.map do |record|
+          next 0 if record.nil?
+
+          record_association = record.association(@association_name)
+          if record_association.reflection.collection?
+            record_association.target.count do |asso_rec|
+              if uniq_records?
+                next false if called_records.include?(asso_rec)
+                called_records.add(asso_rec)
+              end
+
+              true
+            end
+          else
+            next 1 unless compact
+            if uniq_records?
+              next 0 if called_records.include?(record_association.target)
+              called_records.add(record_association.target)
+            end
+            record_association.target.nil? ? 0 : 1
+          end
+        end.sum
+      end
+
+      def empty?
+        size.zero?
+      end
+
+      # This method is for dealing with `Array.wrap` used in `#grouped_record`
+      # used inside`ActiveRecord::Associations::Preloader#preload`
+      # to avoid the enumerator to be wrapped inside an array
+      def to_ary
+        self
+      end
+
+      def compact
+        AssociationArrayLikeEnumerator.new(
+          @parent_records,
+          @association_name,
+          compact: true,
+        )
+      end
+
+      def uniq!
+        @uniq_records = true
+        # Invalidate cache
+        @size = nil
+        @enumerator = nil
+      end
+
+      private
+
+      def enumerator
+        @enumerator ||= Enumerator.new(size) do |y|
+          called_records = uniq_records? ? Set.new : nil
+
+          @parent_records.each do |record|
+            next if record.nil?
+
+            record_association = record.association(@association_name)
+            if record_association.reflection.collection?
+              record_association.target.each do |asso_rec|
+                if uniq_records?
+                  next if called_records.include?(asso_rec)
+                  called_records.add(asso_rec)
+                end
+
+                y.yield(asso_rec)
+              end
+            else
+              next if compact && record_association.target.nil?
+              if uniq_records?
+                next if called_records.include?(record_association.target)
+                called_records.add(record_association.target)
+              end
+
+              y.yield(record_association.target)
+            end
+          end
+        end
       end
     end
+    private_constant :AssociationArrayLikeEnumerator
   end
 end
